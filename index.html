@@ -68,10 +68,13 @@
 
 <div class="card">
   <div class="row">
-    <button id="exVideo" class="pri" disabled>Video exportieren (MP4/WebM)</button>
+    <button id="exMp4" class="pri" disabled>MP4 für WhatsApp</button>
+    <button id="exVideo" disabled>Video (Echtzeit-Export)</button>
     <button id="exWav" disabled>Mix (WAV)</button>
     <button id="exNarr" disabled>Nur Sprache (WAV)</button>
   </div>
+  <div class="row"><button id="share" style="display:none">📤 Teilen (z. B. WhatsApp)</button></div>
+  <small>„MP4 für WhatsApp“ setzt deinen Mix in das Original-Video ein (Bild bleibt unverändert, nur WebM/MKV/AVI werden neu kodiert). Beim ersten Mal lädt der Konverter einmalig ca. 30 MB, dafür braucht es Internet.</small>
   <small>Video-Export läuft in Echtzeit (so lang wie das Video). Für MP4 mit Originalbild:<br>
   <code>ffmpeg -i video.mp4 -i mix.wav -map 0:v -map 1:a -c:v copy -shortest out.mp4</code></small>
 </div>
@@ -79,7 +82,7 @@
 <script>
 const $=id=>document.getElementById(id);
 const v=$('v');
-let ctx, narr, takes=[], src=null, micStream=null, recorder=null, recInfo=null, playing=false, startedAt=0, startPos=0, raf=0;
+let videoFile=null, ctx, narr, takes=[], src=null, micStream=null, recorder=null, recInfo=null, playing=false, startedAt=0, startPos=0, raf=0;
 
 function fmt(t){t=Math.max(0,t);return Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0')}
 function status(s){$('status').textContent=s}
@@ -87,11 +90,11 @@ function ac(){ if(!ctx) ctx=new (window.AudioContext||window.webkitAudioContext)
 
 // ---------- Video laden ----------
 $('file').onchange=e=>{
-  const f=e.target.files[0]; if(!f) return;
+  const f=e.target.files[0]; if(!f) return; videoFile=f;
   v.src=URL.createObjectURL(f); v.muted=true;
   v.onloadedmetadata=()=>{
     const c=ac(); narr=c.createBuffer(1,Math.ceil(v.duration*c.sampleRate),c.sampleRate); takes=[];
-    ['play','seek','rec','exVideo','exWav','exNarr'].forEach(i=>$(i).disabled=false); $('undo').disabled=true;
+    ['play','seek','rec','exMp4','exVideo','exWav','exNarr'].forEach(i=>$(i).disabled=false); $('undo').disabled=true;
     status('Bereit. Zur gewünschten Stelle springen und „Aufnahme“ drücken.'); draw(); tick();
     listMics();
   };
@@ -288,6 +291,50 @@ $('exVideo').onclick=async()=>{
   v.onended=()=>r.stop();
   r.start(); nodes=buildGraph(c,dest,c.currentTime,0,{narr:true,music:true}); v.play();
 };
+
+// ---------- MP4 für WhatsApp (ffmpeg im Browser) ----------
+let ff=null, lastMp4=null;
+const FF='https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd', CORE='https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+const blobURL=async(u,t)=>{const r=await fetch(u); if(!r.ok) throw new Error('Download fehlgeschlagen ('+r.status+')'); return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type:t}))};
+const loadScript=u=>new Promise((res,rej)=>{const s=document.createElement('script'); s.src=u; s.onload=res; s.onerror=()=>rej(new Error('Konverter nicht ladbar')); document.head.appendChild(s)});
+async function getFF(){
+  if(ff) return ff;
+  status('Lade Konverter (einmalig ca. 30 MB) …');
+  await loadScript(FF+'/ffmpeg.js');
+  const f=new FFmpegWASM.FFmpeg();
+  f.on('progress',({progress})=>status('Konvertiere … '+Math.min(100,Math.max(0,Math.round(progress*100)))+' %'));
+  await f.load({
+    classWorkerURL:await blobURL(FF+'/814.ffmpeg.js','text/javascript'),
+    coreURL:await blobURL(CORE+'/ffmpeg-core.js','text/javascript'),
+    wasmURL:await blobURL(CORE+'/ffmpeg-core.wasm','application/wasm')});
+  return ff=f;
+}
+$('exMp4').onclick=async()=>{
+  if(!videoFile) return;
+  $('exMp4').disabled=true; $('share').style.display='none';
+  try{
+    status('Mische Ton …');
+    const mix=wav(await renderMix({narr:true,music:true}));
+    const f=await getFF();
+    const ext=(videoFile.name.split('.').pop()||'mp4').toLowerCase().replace(/[^a-z0-9]/g,'')||'mp4', inName='in.'+ext;
+    await f.writeFile(inName,new Uint8Array(await videoFile.arrayBuffer()));
+    await f.writeFile('mix.wav',new Uint8Array(await mix.arrayBuffer()));
+    const base=['-y','-i',inName,'-i','mix.wav','-map','0:v:0','-map','1:a:0'];
+    const tail=['-c:a','aac','-b:a','160k','-movflags','+faststart','-shortest','out.mp4'];
+    let code=1;
+    if(!['webm','mkv','avi'].includes(ext)){ status('Füge Ton ein …'); code=await f.exec([...base,'-c:v','copy',...tail]); }
+    if(code!==0){ status('Kodiere Video neu (dauert länger) …'); code=await f.exec([...base,'-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p',...tail]); }
+    if(code!==0) throw new Error('ffmpeg-Fehler '+code);
+    const data=await f.readFile('out.mp4');
+    lastMp4=new File([data],'video-whatsapp.mp4',{type:'video/mp4'});
+    save(lastMp4,'video-whatsapp.mp4');
+    if(navigator.canShare&&navigator.canShare({files:[lastMp4]})) $('share').style.display='';
+    status('MP4 fertig.');
+    for(const n of [inName,'mix.wav','out.mp4']) await f.deleteFile(n).catch(()=>{});
+  }catch(err){ status('MP4-Export nicht möglich ('+err.message+'). Nimm „Mix (WAV)“ und den ffmpeg-Befehl.') }
+  $('exMp4').disabled=false;
+};
+$('share').onclick=()=>navigator.share({files:[lastMp4]}).catch(()=>{});
 </script>
 </body>
 </html>
