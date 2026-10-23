@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Narration</title>
+<style>
+  :root{--bg:#14161a;--card:#1e2128;--tx:#e8eaee;--mut:#8b919c;--acc:#4f9dff;--rec:#e5484d}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:16px system-ui,sans-serif;padding:12px;max-width:760px;margin:auto}
+  h1{font-size:20px;margin:6px 0 12px}
+  .card{background:var(--card);border-radius:12px;padding:12px;margin-bottom:12px}
+  video{width:100%;max-height:50vh;background:#000;border-radius:8px;display:block}
+  button,.btn{background:#2b303a;color:var(--tx);border:0;border-radius:8px;padding:10px 14px;font-size:15px;cursor:pointer}
+  button.rec{background:var(--rec)} button.pri{background:var(--acc);color:#fff}
+  button:disabled{opacity:.4}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+  input[type=range]{flex:1;min-width:120px}
+  label{color:var(--mut);font-size:14px}
+  .meter{height:8px;background:#2b303a;border-radius:4px;overflow:hidden}
+  .meter>div{height:100%;width:0;background:var(--acc)}
+  canvas{width:100%;height:60px;background:#101216;border-radius:8px;display:block;margin-top:8px}
+  #status{color:var(--mut);font-size:14px;margin-top:6px;min-height:20px}
+  small{color:var(--mut)}
+  .clip{background:#262a33;border-radius:8px;padding:10px;margin-top:10px}
+  .clip input[type=number]{width:70px;background:#14161a;color:var(--tx);border:1px solid #3a404c;border-radius:6px;padding:6px}
+  .clip button{padding:6px 10px;font-size:13px}
+</style>
+</head>
+<body>
+<h1>🎙️ Narration über Video</h1>
+
+<div class="card">
+  <input type="file" id="file" accept="video/*">
+  <video id="v" playsinline muted></video>
+  <canvas id="wave" width="800" height="120"></canvas>
+  <div class="row">
+    <button id="play" disabled>▶ Vorschau</button>
+    <input type="range" id="seek" min="0" max="1000" value="0" disabled>
+    <span id="time">0:00</span>
+  </div>
+  <div id="status">Video wählen, um zu starten.</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="rec" class="rec" disabled>● Aufnahme ab hier</button>
+    <button id="undo" disabled>↩ Letzte Aufnahme löschen</button>
+  </div>
+  <div class="meter" style="margin-top:10px"><div id="lvl"></div></div>
+  <div class="row"><label>Mikrofon</label><select id="mic"></select></div>
+  <div class="row"><label>Originalton als Orientierung: <span id="gv">0</span>%</label>
+    <input type="range" id="guide" min="0" max="100" value="0"></div>
+  <div class="row"><label>Latenz-Ausgleich (Bluetooth): <span id="ov">0</span> ms</label>
+    <input type="range" id="off" min="0" max="600" step="5" value="0"></div>
+  <small>Der Originalton wird nie ins Ergebnis übernommen. Die Sprache wird um den Latenz-Wert früher gesetzt (wirkt auch nachträglich auf alle Aufnahmen). Mit Kopfhörer aufnehmen, sonst hört das Mikro den Originalton mit.</small>
+</div>
+
+<div class="card">
+  <b>Musik &amp; Mix</b>
+  <div class="row"><input type="file" id="music" accept="audio/*" multiple></div>
+  <div id="clips"></div>
+  <div class="row"><label>Sprache Lautstärke: <span id="nvl">100</span>%</label>
+    <input type="range" id="nv" min="0" max="200" value="100"></div>
+  <div class="row"><label><input type="checkbox" id="hearMusic" checked> Musik beim Aufnehmen mithören</label></div>
+  <small>Jeder Titel liegt auf der Videozeit (Start in Sekunden). Für einen Übergang: „An Vorgänger anschließen“ legt den Titel überlappend an und setzt Fade-out und Fade-in passend. Die grünen Balken in der Wellenform zeigen die Musik.</small>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="exVideo" class="pri" disabled>Video exportieren (MP4/WebM)</button>
+    <button id="exWav" disabled>Mix (WAV)</button>
+    <button id="exNarr" disabled>Nur Sprache (WAV)</button>
+  </div>
+  <small>Video-Export läuft in Echtzeit (so lang wie das Video). Für MP4 mit Originalbild:<br>
+  <code>ffmpeg -i video.mp4 -i mix.wav -map 0:v -map 1:a -c:v copy -shortest out.mp4</code></small>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v');
+let ctx, narr, takes=[], src=null, micStream=null, recorder=null, recInfo=null, playing=false, startedAt=0, startPos=0, raf=0;
+
+function fmt(t){t=Math.max(0,t);return Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0')}
+function status(s){$('status').textContent=s}
+function ac(){ if(!ctx) ctx=new (window.AudioContext||window.webkitAudioContext)(); if(ctx.state==='suspended') ctx.resume(); return ctx }
+
+// ---------- Video laden ----------
+$('file').onchange=e=>{
+  const f=e.target.files[0]; if(!f) return;
+  v.src=URL.createObjectURL(f); v.muted=true;
+  v.onloadedmetadata=()=>{
+    const c=ac(); narr=c.createBuffer(1,Math.ceil(v.duration*c.sampleRate),c.sampleRate); takes=[];
+    ['play','seek','rec','exVideo','exWav','exNarr'].forEach(i=>$(i).disabled=false); $('undo').disabled=true;
+    status('Bereit. Zur gewünschten Stelle springen und „Aufnahme“ drücken.'); draw(); tick();
+    listMics();
+  };
+};
+
+async function listMics(){
+  try{
+    const tmp=await navigator.mediaDevices.getUserMedia({audio:true}); tmp.getTracks().forEach(t=>t.stop());
+    const d=(await navigator.mediaDevices.enumerateDevices()).filter(x=>x.kind==='audioinput');
+    $('mic').innerHTML=d.map(x=>`<option value="${x.deviceId}">${x.label||'Mikrofon'}</option>`).join('');
+  }catch(e){status('Mikrofon-Zugriff nicht möglich: '+e.message)}
+}
+
+// ---------- Narration-Puffer aus Takes aufbauen ----------
+function rebuild(){
+  const c=ac(); narr=c.createBuffer(1,Math.ceil(v.duration*c.sampleRate),c.sampleRate);
+  const out=narr.getChannelData(0), sr=c.sampleRate, off=+$('off').value/1000;
+  for(const t of takes){
+    const s=Math.round((t.t0-off)*sr), d=t.data;
+    for(let i=0;i<d.length;i++){const j=s+i; if(j>=0&&j<out.length) out[j]=d[i]}
+  }
+  $('undo').disabled=!takes.length; draw();
+}
+$('off').oninput=e=>{$('ov').textContent=e.target.value; if(narr) rebuild(); if(playing) restart()};
+$('guide').oninput=e=>{$('gv').textContent=e.target.value; applyGuide()};
+function applyGuide(){const g=$('guide').value/100; v.muted=g===0; v.volume=g}
+
+// ---------- Wiedergabe (Video stumm + Narration) ----------
+let nodes=[];
+function stopNodes(){nodes.forEach(s=>{try{s.stop()}catch{}}); nodes=[]}
+function envPoints(k){
+  const d=k.buf.duration, fi=Math.min(k.fi,d), fo=Math.min(k.fo,d-fi);
+  return [[0,fi>0?0:k.vol],[fi,k.vol],[d-fo,k.vol],[d,fo>0?0:k.vol]];
+}
+function envAt(p,t){
+  for(let i=1;i<p.length;i++) if(t<=p[i][0]){const a=p[i-1],b=p[i]; return b[0]===a[0]?b[1]:a[1]+(b[1]-a[1])*(t-a[0])/(b[0]-a[0])}
+  return p[p.length-1][1];
+}
+// baut Sprache + Musik in einen Audio-Kontext (live oder offline); t0 = Kontextzeit für Videozeit "from"
+function buildGraph(c,dest,t0,from,o){
+  const list=[];
+  if(o.narr){
+    const s=c.createBufferSource(), g=c.createGain(); s.buffer=narr; g.gain.value=+$('nv').value/100;
+    s.connect(g).connect(dest); s.start(t0,from); list.push(s);
+  }
+  if(o.music) for(const k of clips){
+    if(k.start+k.buf.duration<=from) continue;
+    const s=c.createBufferSource(), g=c.createGain(); s.buffer=k.buf; s.connect(g).connect(dest);
+    const tl0=Math.max(0,from-k.start), when=t0+Math.max(0,k.start-from), pts=envPoints(k);
+    g.gain.setValueAtTime(envAt(pts,tl0),when);
+    for(const p of pts) if(p[0]>tl0) g.gain.linearRampToValueAtTime(p[1],when+(p[0]-tl0));
+    s.start(when,tl0); list.push(s);
+  }
+  return list;
+}
+function startPlayback(){
+  const c=ac(); applyGuide();
+  nodes=buildGraph(c,c.destination,c.currentTime,v.currentTime,{narr:true,music:true});
+  v.play(); playing=true; $('play').textContent='⏸ Pause'; tick();
+}
+function stopPlayback(){
+  stopNodes();
+  v.pause(); playing=false; $('play').textContent='▶ Vorschau';
+}
+function restart(){stopPlayback(); startPlayback()}
+$('play').onclick=()=>{ if(recorder) return; playing?stopPlayback():startPlayback() };
+v.onended=()=>{ if(recorder) stopRec(); else stopPlayback() };
+$('seek').oninput=e=>{ v.currentTime=e.target.value/1000*v.duration; if(playing&&!recorder) restart(); tick(true) };
+function tick(once){
+  $('seek').value=v.currentTime/v.duration*1000||0; $('time').textContent=fmt(v.currentTime)+' / '+fmt(v.duration||0); draw();
+  if(!once&&(playing||recorder)) raf=requestAnimationFrame(()=>tick());
+}
+
+// ---------- Aufnahme ----------
+$('rec').onclick=()=>recorder?stopRec():startRec();
+async function startRec(){
+  const c=ac(); if(playing) stopPlayback();
+  try{
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('mic').value?{exact:$('mic').value}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  }catch(e){return status('Mikrofon: '+e.message)}
+  // Pegelanzeige
+  const an=c.createAnalyser(); an.fftSize=512; c.createMediaStreamSource(micStream).connect(an);
+  const buf=new Uint8Array(an.fftSize);
+  const lv=()=>{ if(!recorder) {$('lvl').style.width='0';return} an.getByteTimeDomainData(buf);
+    let m=0; for(const x of buf) m=Math.max(m,Math.abs(x-128)); $('lvl').style.width=Math.min(100,m/128*140)+'%'; requestAnimationFrame(lv)};
+  const chunks=[]; recorder=new MediaRecorder(micStream);
+  recorder.ondataavailable=e=>chunks.push(e.data);
+  recInfo={t0:v.currentTime,chunks};
+  recorder.onstop=finishRec;
+  recorder.start(); applyGuide();
+  if($('hearMusic').checked) nodes=buildGraph(c,c.destination,c.currentTime,v.currentTime,{music:true});
+  v.play();
+  $('rec').textContent='■ Stopp'; $('play').disabled=true; status('Aufnahme läuft …'); lv(); tick();
+}
+function stopRec(){ if(!recorder) return; v.pause(); stopNodes(); recorder.stop(); $('rec').textContent='● Aufnahme ab hier' }
+async function finishRec(){
+  micStream.getTracks().forEach(t=>t.stop());
+  const blob=new Blob(recInfo.chunks,{type:recorder.mimeType}); recorder=null; $('lvl').style.width='0';
+  try{
+    const ab=await ac().decodeAudioData(await blob.arrayBuffer());
+    // auf Mono bei Abtastrate des Kontexts
+    const sr=ctx.sampleRate; let d;
+    if(ab.sampleRate!==sr){ const oc=new OfflineAudioContext(1,Math.ceil(ab.duration*sr),sr); const s=oc.createBufferSource(); s.buffer=ab; s.connect(oc.destination); s.start(); d=(await oc.startRendering()).getChannelData(0).slice() }
+    else { d=new Float32Array(ab.length); for(let ch=0;ch<ab.numberOfChannels;ch++){const x=ab.getChannelData(ch); for(let i=0;i<d.length;i++) d[i]+=x[i]/ab.numberOfChannels} }
+    takes.push({t0:recInfo.t0,data:d}); rebuild();
+    status('Aufnahme gespeichert. Zum Anhören „Vorschau“ drücken.');
+  }catch(e){status('Aufnahme konnte nicht gelesen werden: '+e.message)}
+  $('play').disabled=false; tick(true);
+}
+$('undo').onclick=()=>{takes.pop(); rebuild(); status('Letzte Aufnahme gelöscht.')};
+
+// ---------- Wellenform ----------
+function draw(){
+  const cv=$('wave'), g=cv.getContext('2d'), W=cv.width, H=cv.height; g.clearRect(0,0,W,H);
+  if(!narr) return; const d=narr.getChannelData(0), step=Math.ceil(d.length/W);
+  g.fillStyle='#4f9dff';
+  for(let x=0;x<W;x++){let m=0; for(let i=x*step;i<(x+1)*step&&i<d.length;i++) m=Math.max(m,Math.abs(d[i])); const h=m*H; g.fillRect(x,(H-h)/2,1,Math.max(1,h))}
+  if(v.duration){
+    g.fillStyle='rgba(80,200,120,.75)';
+    clips.forEach((k,i)=>g.fillRect(k.start/v.duration*W,H-8-(i%3)*8,k.buf.duration/v.duration*W,6));
+  }
+  g.fillStyle='#fff'; g.fillRect(v.currentTime/v.duration*W,0,2,H);
+}
+
+// ---------- Export ----------
+function wav(buf){
+  const nc=buf.numberOfChannels, n=buf.length, sr=buf.sampleRate, ba=nc*2, a=new DataView(new ArrayBuffer(44+n*ba));
+  const w=(o,s)=>[...s].forEach((c,i)=>a.setUint8(o+i,c.charCodeAt(0)));
+  w(0,'RIFF');a.setUint32(4,36+n*ba,true);w(8,'WAVEfmt ');a.setUint32(16,16,true);a.setUint16(20,1,true);a.setUint16(22,nc,true);
+  a.setUint32(24,sr,true);a.setUint32(28,sr*ba,true);a.setUint16(32,ba,true);a.setUint16(34,16,true);w(36,'data');a.setUint32(40,n*ba,true);
+  const ch=[...Array(nc).keys()].map(i=>buf.getChannelData(i));
+  for(let i=0;i<n;i++) for(let k=0;k<nc;k++){const s=Math.max(-1,Math.min(1,ch[k][i])); a.setInt16(44+(i*nc+k)*2,s<0?s*32768:s*32767,true)}
+  return new Blob([a],{type:'audio/wav'});
+}
+async function renderMix(o){
+  const sr=ac().sampleRate, oc=new OfflineAudioContext(2,Math.ceil(v.duration*sr),sr);
+  buildGraph(oc,oc.destination,0,0,o); return oc.startRendering();
+}
+
+// ---------- Musik ----------
+let clips=[];
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('music').onchange=async e=>{
+  for(const f of e.target.files){
+    try{
+      const buf=await ac().decodeAudioData(await f.arrayBuffer()), last=clips[clips.length-1];
+      clips.push({name:f.name,buf,start:last?+Math.max(0,last.start+last.buf.duration-2).toFixed(1):0,vol:.5,fi:2,fo:2});
+    }catch(err){status('Konnte '+f.name+' nicht lesen.')}
+  }
+  e.target.value=''; renderClips(); draw();
+};
+function renderClips(){
+  $('clips').innerHTML=clips.map((k,i)=>`<div class="clip"><b>${esc(k.name)}</b> <small>${fmt(k.buf.duration)}</small>
+    <div class="row"><label>Start (s)</label><input type="number" step="0.1" min="0" value="${k.start}" data-i="${i}" data-k="start">
+    <label>Fade-in</label><input type="number" step="0.5" min="0" value="${k.fi}" data-i="${i}" data-k="fi">
+    <label>Fade-out</label><input type="number" step="0.5" min="0" value="${k.fo}" data-i="${i}" data-k="fo"></div>
+    <div class="row"><label>Lautstärke <span id="vl${i}">${Math.round(k.vol*100)}</span>%</label>
+    <input type="range" min="0" max="100" value="${k.vol*100}" data-i="${i}" data-k="vol"></div>
+    <div class="row"><button data-i="${i}" data-act="now">Start = aktuelle Stelle</button>
+    ${i>0?`<button data-i="${i}" data-act="chain">An Vorgänger anschließen</button>`:''}
+    <button data-i="${i}" data-act="del">Entfernen</button></div></div>`).join('');
+}
+$('clips').oninput=e=>{
+  const t=e.target, i=+t.dataset.i, k=t.dataset.k; if(k===undefined) return;
+  clips[i][k]=k==='vol'?t.value/100:Math.max(0,+t.value||0);
+  if(k==='vol') $('vl'+i).textContent=t.value; draw();
+};
+$('clips').onchange=()=>{ if(playing&&!recorder) restart() };
+$('clips').onclick=e=>{
+  const b=e.target.closest('button'); if(!b) return;
+  const i=+b.dataset.i, k=clips[i], act=b.dataset.act;
+  if(act==='now') k.start=+v.currentTime.toFixed(1);
+  if(act==='chain'&&i>0){const p=clips[i-1], x=Math.min(3,p.buf.duration/2,k.buf.duration/2);
+    k.start=+(p.start+p.buf.duration-x).toFixed(1); p.fo=x; k.fi=x}
+  if(act==='del') clips.splice(i,1);
+  renderClips(); draw(); if(playing&&!recorder) restart();
+};
+$('nv').oninput=e=>$('nvl').textContent=e.target.value;
+$('nv').onchange=()=>{ if(playing&&!recorder) restart() };
+function save(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click()}
+$('exWav').onclick=async()=>{status('Mische …'); save(wav(await renderMix({narr:true,music:true})),'mix.wav'); status('Mix exportiert.')};
+$('exNarr').onclick=async()=>{status('Rendere …'); save(wav(await renderMix({narr:true})),'narration.wav'); status('Sprache exportiert.')};
+
+$('exVideo').onclick=async()=>{
+  if(!v.captureStream) return status('Dieser Browser kann kein Video exportieren – nimm „Nur Sprache (WAV)“ und den ffmpeg-Befehl.');
+  const c=ac(); stopPlayback(); v.muted=true; v.currentTime=0; await new Promise(r=>setTimeout(r,200));
+  const dest=c.createMediaStreamDestination();
+  const vs=v.captureStream(), out=new MediaStream([...vs.getVideoTracks(),...dest.stream.getAudioTracks()]);
+  const mt=['video/mp4;codecs=avc1,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(t=>MediaRecorder.isTypeSupported(t));
+  const ch=[], r=new MediaRecorder(out,{mimeType:mt});
+  r.ondataavailable=e=>ch.push(e.data);
+  r.onstop=()=>{stopNodes(); save(new Blob(ch,{type:mt.split(';')[0]}),'video-mit-narration.'+(mt.startsWith('video/mp4')?'mp4':'webm')); status('Export fertig.'); $('exVideo').disabled=false; v.onended=()=>stopPlayback()};
+  $('exVideo').disabled=true; status('Export läuft in Echtzeit – bitte warten …');
+  v.onended=()=>r.stop();
+  r.start(); nodes=buildGraph(c,dest,c.currentTime,0,{narr:true,music:true}); v.play();
+};
+</script>
+</body>
+</html>
